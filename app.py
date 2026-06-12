@@ -1,748 +1,43 @@
 import os
-import re
 import sqlite3
-import json
-import io
 from datetime import datetime
+
 import streamlit as st
 import pandas as pd
-from dotenv import load_dotenv
 
-# Email Modules
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
-
-# File Processing
-from docx import Document as DocxReader
-
-# LangChain & Vector DB
-from langchain_chroma import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langchain_core.documents import Document
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_groq import ChatGroq
-
-# Native Groq Client for Audio/Whisper
-from groq import Groq
-
-# Duplicate Detection
-import difflib
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
+from config import GROQ_API_KEY, INTEL_DB
+from database import init_db, get_dashboard_stats, get_table_df, update_status
+from resources import init_resources, init_vector_store
+from email_engine import send_email_alert, generate_meeting_summary_email_body
+from parsing import parse_uploaded_file
+from duplicate_engine import (
+    get_duplicate_clusters,
+    get_escalation_recurrence_timeline,
+)
+from ai_extraction import extract_intelligence, store_intelligence, answer_nl_query
 
 # ══════════════════════════════════════════
-# CONFIG & ENV
+# STARTUP CHECKS
 # ══════════════════════════════════════════
-load_dotenv()
-if not os.getenv("GROQ_API_KEY"):
+if not GROQ_API_KEY:
     st.error("Missing GROQ_API_KEY in .env file.")
     st.stop()
 
-SENDER_EMAIL = os.getenv("GMAIL_USER")
-APP_PASSWORD  = os.getenv("GMAIL_PASS")
-
-INTEL_DB    = "meeting_intel.db"
-CHROMA_PATH = "./chroma_meeting_db"
-COLLECTION  = "meeting_transcripts"
-
-# ─── Duplicate Detection Thresholds ───────
-FUZZY_THRESHOLD  = 0.75   # difflib ratio for string similarity
-TFIDF_THRESHOLD  = 0.55   # cosine similarity for semantic matching
-# ──────────────────────────────────────────
-
-
-# ══════════════════════════════════════════
-# DATABASE SCHEMA
-# ══════════════════════════════════════════
-def init_db():
-    conn = sqlite3.connect(INTEL_DB)
-    c = conn.cursor()
-
-    c.execute("""CREATE TABLE IF NOT EXISTS meetings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        ingested_at TEXT,
-        raw_content TEXT,
-        source_type TEXT
-    )""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS projects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        meeting_id INTEGER,
-        name TEXT,
-        status TEXT,
-        description TEXT,
-        FOREIGN KEY(meeting_id) REFERENCES meetings(id)
-    )""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS action_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        meeting_id INTEGER,
-        task TEXT,
-        owner TEXT,
-        deadline TEXT,
-        priority TEXT,
-        status TEXT DEFAULT 'Pending',
-        FOREIGN KEY(meeting_id) REFERENCES meetings(id)
-    )""")
-
-    # ── ENHANCED escalations schema ──────────────────────────────────────────
-    # New columns:
-    #   duplicate_of      → id of the canonical (first-seen) escalation, NULL if original
-    #   occurrence_count  → how many times this exact issue has recurred across meetings
-    #   similarity_score  → float 0-1, how similar it was to the matched canonical
-    #   detection_method  → 'exact'|'fuzzy'|'semantic' — which algo caught it
-    # ─────────────────────────────────────────────────────────────────────────
-    c.execute("""CREATE TABLE IF NOT EXISTS escalations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        meeting_id INTEGER,
-        issue TEXT,
-        raised_by TEXT,
-        assigned_to TEXT,
-        severity TEXT,
-        status TEXT DEFAULT 'Open',
-        duplicate_of INTEGER DEFAULT NULL,
-        occurrence_count INTEGER DEFAULT 1,
-        similarity_score REAL DEFAULT NULL,
-        detection_method TEXT DEFAULT NULL,
-        FOREIGN KEY(meeting_id) REFERENCES meetings(id),
-        FOREIGN KEY(duplicate_of) REFERENCES escalations(id)
-    )""")
-
-    # Migration: add new columns to existing DBs that were created without them
-    for col, definition in [
-        ("duplicate_of",     "INTEGER DEFAULT NULL"),
-        ("occurrence_count", "INTEGER DEFAULT 1"),
-        ("similarity_score", "REAL DEFAULT NULL"),
-        ("detection_method", "TEXT DEFAULT NULL"),
-    ]:
-        try:
-            c.execute(f"ALTER TABLE escalations ADD COLUMN {col} {definition}")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-
-    c.execute("""CREATE TABLE IF NOT EXISTS risks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        meeting_id INTEGER,
-        description TEXT,
-        impact TEXT,
-        teams_involved TEXT,
-        severity TEXT,
-        FOREIGN KEY(meeting_id) REFERENCES meetings(id)
-    )""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS decisions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        meeting_id INTEGER,
-        decision TEXT,
-        rationale TEXT,
-        decision_maker TEXT,
-        FOREIGN KEY(meeting_id) REFERENCES meetings(id)
-    )""")
-
-    c.execute("""CREATE TABLE IF NOT EXISTS stakeholders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        meeting_id INTEGER,
-        name TEXT,
-        role TEXT,
-        responsibility TEXT,
-        FOREIGN KEY(meeting_id) REFERENCES meetings(id)
-    )""")
-
-    conn.commit()
-    conn.close()
-
 init_db()
 
-
-# ══════════════════════════════════════════
-# LLM, EMBEDDINGS & AUDIO CLIENT
-# ══════════════════════════════════════════
-@st.cache_resource
-def init_resources():
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.1)
-    try:
-        groq_audio_client = Groq()
-    except Exception as e:
-        st.error(f"Failed to initialize Groq Audio Client. Error: {e}")
-        groq_audio_client = None
-    return embeddings, llm, groq_audio_client
-
+# Pre-warm cached resources so they're ready for all pages
 embeddings, llm, groq_audio_client = init_resources()
-
-@st.cache_resource
-def init_vector_store():
-    return Chroma(
-        persist_directory=CHROMA_PATH,
-        embedding_function=embeddings,
-        collection_name=COLLECTION
-    )
-
 vector_store = init_vector_store()
 
 
 # ══════════════════════════════════════════
-# AUTOMATED EMAIL ENGINE
-# ══════════════════════════════════════════
-def send_email_alert(subject, body, to_email, attachment=None, attachment_name=""):
-    if not SENDER_EMAIL or not APP_PASSWORD:
-        st.error("Email configuration missing. Please verify GMAIL_USER and GMAIL_PASS in your environment.")
-        return False
-    if not to_email or to_email == "manager@example.com":
-        st.warning("Skipping email alert: Please provide a valid recipient email address.")
-        return False
-
-    msg = MIMEMultipart()
-    msg['From'] = SENDER_EMAIL
-    msg['To'] = to_email
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
-
-    if attachment is not None:
-        payload = MIMEBase('application', 'octet-stream')
-        payload.set_payload(attachment.read())
-        encoders.encode_base64(payload)
-        payload.add_header('Content-Disposition', f'attachment; filename={attachment_name}')
-        msg.attach(payload)
-        attachment.seek(0)
-
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(SENDER_EMAIL, APP_PASSWORD)
-        server.sendmail(SENDER_EMAIL, to_email, msg.as_string())
-        server.quit()
-        st.toast(f"✉️ Email Alert Dispatched to {to_email}!")
-        return True
-    except Exception as e:
-        st.error(f"Failed to transmit email notification: {e}")
-        return False
-
-def generate_meeting_summary_email_body(intel: dict) -> str:
-    title = intel.get("meeting_title", "Untitled Meeting")
-    body  = f"Hello,\n\nA new meeting context has been ingested into MeetingIQ.\n\n"
-    body += f"📌 MEETING TITLE: {title}\n"
-    body += "═" * 40 + "\n\n"
-    sections = [
-        ("🗂 PROJECTS & INITIATIVES",    "projects",     ["name", "status", "description"]),
-        ("✅ EXTRACTED ACTION ITEMS",     "action_items", ["task", "owner", "deadline", "priority"]),
-        ("🚨 ESCALATIONS LOGGED",        "escalations",  ["issue", "raised_by", "assigned_to", "severity"]),
-        ("⚠️ RISK REGISTER ENTRIES",     "risks",        ["description", "impact", "teams_involved", "severity"]),
-        ("🎯 CRITICAL DECISIONS LOGGED", "decisions",    ["decision", "rationale", "decision_maker"])
-    ]
-    for label, key, fields in sections:
-        items = intel.get(key, [])
-        body += f"{label}:\n"
-        if not items:
-            body += "  • None detected\n"
-        else:
-            for i, item in enumerate(items, 1):
-                body += f"  {i}. "
-                details = [f"{f.replace('_',' ').title()}: {item.get(f,'N/A')}" for f in fields if item.get(f)]
-                body += " | ".join(details) + "\n"
-        body += "\n"
-    body += "This is an automated operational notification generated via MeetingIQ."
-    return body
-
-
-# ══════════════════════════════════════════
-# DUPLICATE ESCALATION DETECTION ENGINE
-# ══════════════════════════════════════════
-
-def _normalize(text: str) -> str:
-    """Lowercase, strip punctuation noise, collapse whitespace."""
-    text = text.lower().strip()
-    text = re.sub(r'\[re-raised in meeting:.*?\]', '', text)   # strip old append notes
-    text = re.sub(r'\s+', ' ', text)
-    return text
-
-
-def _tfidf_similarity(text_a: str, text_b: str) -> float:
-    """Return cosine similarity between two texts using TF-IDF."""
-    try:
-        vec = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True)
-        tfidf = vec.fit_transform([text_a, text_b])
-        score = cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
-        return float(score)
-    except Exception:
-        return 0.0
-
-
-def find_duplicate_escalation(
-    issue_text: str,
-    conn: sqlite3.Connection,
-    exclude_id: int = None,
-) -> dict | None:
-    """
-    Three-pass duplicate detection:
-      Pass 1 — Exact / substring containment  → method='exact'
-      Pass 2 — Fuzzy string ratio (difflib)   → method='fuzzy'
-      Pass 3 — TF-IDF cosine similarity        → method='semantic'
-
-    Returns a dict {id, issue, similarity_score, detection_method, occurrence_count}
-    for the best canonical match, or None if no duplicate found.
-    """
-    c = conn.cursor()
-    # Only compare against *canonical* originals (duplicate_of IS NULL) that are still Open
-    query = "SELECT id, issue, occurrence_count FROM escalations WHERE status='Open' AND duplicate_of IS NULL"
-    if exclude_id:
-        query += f" AND id != {int(exclude_id)}"
-    c.execute(query)
-    open_originals = c.fetchall()
-
-    if not open_originals:
-        return None
-
-    norm_new = _normalize(issue_text)
-    best_match = None
-    best_score = 0.0
-
-    for esc_id, existing_issue, occ_count in open_originals:
-        norm_existing = _normalize(existing_issue)
-
-        # ── Pass 1: exact / substring ────────────────────────────────────────
-        if norm_new == norm_existing:
-            return {"id": esc_id, "issue": existing_issue,
-                    "similarity_score": 1.0, "detection_method": "exact",
-                    "occurrence_count": occ_count}
-
-        if norm_new in norm_existing or norm_existing in norm_new:
-            score = len(min(norm_new, norm_existing, key=len)) / len(max(norm_new, norm_existing, key=len))
-            if score > best_score:
-                best_score = score
-                best_match = {"id": esc_id, "issue": existing_issue,
-                              "similarity_score": round(score, 3),
-                              "detection_method": "exact",
-                              "occurrence_count": occ_count}
-
-        # ── Pass 2: fuzzy string ratio ───────────────────────────────────────
-        fuzzy_score = difflib.SequenceMatcher(None, norm_new, norm_existing).ratio()
-        if fuzzy_score >= FUZZY_THRESHOLD and fuzzy_score > best_score:
-            best_score = fuzzy_score
-            best_match = {"id": esc_id, "issue": existing_issue,
-                          "similarity_score": round(fuzzy_score, 3),
-                          "detection_method": "fuzzy",
-                          "occurrence_count": occ_count}
-
-        # ── Pass 3: semantic TF-IDF ──────────────────────────────────────────
-        tfidf_score = _tfidf_similarity(norm_new, norm_existing)
-        if tfidf_score >= TFIDF_THRESHOLD and tfidf_score > best_score:
-            best_score = tfidf_score
-            best_match = {"id": esc_id, "issue": existing_issue,
-                          "similarity_score": round(tfidf_score, 3),
-                          "detection_method": "semantic",
-                          "occurrence_count": occ_count}
-
-    return best_match
-
-
-def get_escalation_recurrence_timeline(canonical_id: int) -> pd.DataFrame:
-    """Return all occurrences (original + duplicates) of an escalation cluster."""
-    conn = sqlite3.connect(INTEL_DB)
-    df = pd.read_sql("""
-        SELECT e.id, m.title AS Meeting, m.ingested_at AS Date,
-               e.issue AS Issue, e.raised_by AS 'Raised By',
-               e.severity AS Severity, e.status AS Status,
-               e.duplicate_of AS 'Duplicate Of',
-               e.similarity_score AS 'Similarity',
-               e.detection_method AS 'Detected Via',
-               e.occurrence_count AS 'Occurrence #'
-        FROM escalations e
-        JOIN meetings m ON e.meeting_id = m.id
-        WHERE e.id = ? OR e.duplicate_of = ?
-        ORDER BY m.ingested_at ASC
-    """, conn, params=(canonical_id, canonical_id))
-    conn.close()
-    return df
-
-
-def get_duplicate_clusters() -> list[dict]:
-    """
-    Return all escalation clusters that have at least one duplicate.
-    Each cluster: {canonical, occurrences: [rows]}
-    """
-    conn = sqlite3.connect(INTEL_DB)
-
-    # Get all canonical escalations that have been re-raised
-    df_canonical = pd.read_sql("""
-        SELECT e.id, e.issue, e.raised_by, e.severity, e.status,
-               e.occurrence_count, m.title AS meeting, m.ingested_at AS first_seen
-        FROM escalations e
-        JOIN meetings m ON e.meeting_id = m.id
-        WHERE e.duplicate_of IS NULL
-          AND e.occurrence_count > 1
-        ORDER BY e.occurrence_count DESC, e.id DESC
-    """, conn)
-
-    clusters = []
-    for _, canon in df_canonical.iterrows():
-        df_dupes = pd.read_sql("""
-            SELECT e.id, e.issue, e.raised_by, e.severity, e.status,
-                   e.similarity_score, e.detection_method,
-                   m.title AS meeting, m.ingested_at AS seen_at
-            FROM escalations e
-            JOIN meetings m ON e.meeting_id = m.id
-            WHERE e.duplicate_of = ?
-            ORDER BY m.ingested_at ASC
-        """, conn, params=(int(canon["id"]),))
-        clusters.append({"canonical": canon, "duplicates": df_dupes})
-
-    conn.close()
-    return clusters
-
-
-# ══════════════════════════════════════════
-# AI EXTRACTION ENGINE
-# ══════════════════════════════════════════
-EXTRACTION_PROMPT = """You are an expert organizational intelligence analyst. Extract ALL structured information from the meeting content below.
-
-Return a single valid JSON object with EXACTLY these keys (use empty lists/strings if nothing found):
-
-{{
-  "meeting_title": "string - infer a descriptive title",
-  "projects": [
-    {{"name": "string", "status": "string", "description": "string"}}
-  ],
-  "action_items": [
-    {{"task": "string", "owner": "string", "deadline": "string or empty", "priority": "High|Medium|Low"}}
-  ],
-  "escalations": [
-    {{"issue": "string", "raised_by": "string", "assigned_to": "string or empty", "severity": "Critical|High|Medium|Low"}}
-  ],
-  "risks": [
-    {{"description": "string", "impact": "string", "teams_involved": "string", "severity": "Critical|High|Medium|Low"}}
-  ],
-  "decisions": [
-    {{"decision": "string", "rationale": "string", "decision_maker": "string or empty"}}
-  ],
-  "stakeholders": [
-    {{"name": "string", "role": "string", "responsibility": "string"}}
-  ]
-}}
-
-MEETING CONTENT:
-{content}
-
-Return ONLY the JSON. No markdown, no explanation, no extra text."""
-
-def extract_intelligence(content: str) -> dict:
-    prompt = EXTRACTION_PROMPT.format(content=content)
-    try:
-        response = llm.invoke([SystemMessage(content=prompt)]).content.strip()
-        response = re.sub(r"```json|```", "", response).strip()
-        return json.loads(response)
-    except json.JSONDecodeError:
-        match = re.search(r'\{.*\}', response, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except:
-                pass
-        return {"meeting_title": "Untitled Meeting", "projects": [], "action_items": [],
-                "escalations": [], "risks": [], "decisions": [], "stakeholders": []}
-    except Exception as e:
-        st.error(f"Extraction error: {e}")
-        return {}
-
-
-# ══════════════════════════════════════════
-# INTELLIGENCE STORAGE (with dup detection)
-# ══════════════════════════════════════════
-def store_intelligence(intel: dict, raw_content: str, source_type: str) -> tuple[int, list]:
-    """
-    Returns (meeting_id, dup_report) where dup_report is a list of dicts
-    describing any duplicate escalations found during this ingest.
-    """
-    conn = sqlite3.connect(INTEL_DB)
-    c = conn.cursor()
-
-    title = intel.get("meeting_title", "Untitled Meeting")
-    now   = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    c.execute("INSERT INTO meetings (title, ingested_at, raw_content, source_type) VALUES (?,?,?,?)",
-              (title, now, raw_content, source_type))
-    meeting_id = c.lastrowid
-
-    for p in intel.get("projects", []):
-        c.execute("INSERT INTO projects (meeting_id, name, status, description) VALUES (?,?,?,?)",
-                  (meeting_id, p.get("name",""), p.get("status",""), p.get("description","")))
-
-    for a in intel.get("action_items", []):
-        c.execute("INSERT INTO action_items (meeting_id, task, owner, deadline, priority) VALUES (?,?,?,?,?)",
-                  (meeting_id, a.get("task",""), a.get("owner",""), a.get("deadline",""), a.get("priority","Medium")))
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # DUPLICATE ESCALATION DETECTION (Three-pass engine)
-    # ══════════════════════════════════════════════════════════════════════════
-    dup_report = []
-
-    for e in intel.get("escalations", []):
-        issue_desc   = e.get("issue", "")
-        new_severity = e.get("severity", "Medium")
-
-        match = find_duplicate_escalation(issue_desc, conn)
-
-        if match:
-            canonical_id = match["id"]
-            score        = match["similarity_score"]
-            method       = match["detection_method"]
-
-            # Insert as a duplicate record (keeps full audit trail)
-            c.execute("""
-                INSERT INTO escalations
-                  (meeting_id, issue, raised_by, assigned_to, severity,
-                   duplicate_of, similarity_score, detection_method)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, (meeting_id, issue_desc, e.get("raised_by",""), e.get("assigned_to",""),
-                  new_severity, canonical_id, score, method))
-
-            # Bump occurrence counter on the canonical record
-            c.execute("UPDATE escalations SET occurrence_count = occurrence_count + 1 WHERE id = ?",
-                      (canonical_id,))
-
-            # Escalate severity on canonical if this instance is more severe
-            severity_rank = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
-            current_sev = c.execute("SELECT severity FROM escalations WHERE id=?", (canonical_id,)).fetchone()[0]
-            if severity_rank.get(new_severity, 0) > severity_rank.get(current_sev, 0):
-                c.execute("UPDATE escalations SET severity=? WHERE id=?", (new_severity, canonical_id))
-
-            dup_report.append({
-                "issue":        issue_desc,
-                "canonical_id": canonical_id,
-                "canonical_issue": match["issue"],
-                "similarity":   score,
-                "method":       method,
-                "occurrences":  match["occurrence_count"] + 1,
-            })
-
-        else:
-            # Brand-new escalation → store as canonical
-            c.execute("""
-                INSERT INTO escalations
-                  (meeting_id, issue, raised_by, assigned_to, severity,
-                   occurrence_count, duplicate_of)
-                VALUES (?,?,?,?,?,1,NULL)
-            """, (meeting_id, issue_desc, e.get("raised_by",""), e.get("assigned_to",""), new_severity))
-
-    # ══════════════════════════════════════════════════════════════════════════
-
-    for r in intel.get("risks", []):
-        c.execute("INSERT INTO risks (meeting_id, description, impact, teams_involved, severity) VALUES (?,?,?,?,?)",
-                  (meeting_id, r.get("description",""), r.get("impact",""), r.get("teams_involved",""), r.get("severity","Medium")))
-
-    for d in intel.get("decisions", []):
-        c.execute("INSERT INTO decisions (meeting_id, decision, rationale, decision_maker) VALUES (?,?,?,?)",
-                  (meeting_id, d.get("decision",""), d.get("rationale",""), d.get("decision_maker","")))
-
-    for s in intel.get("stakeholders", []):
-        c.execute("INSERT INTO stakeholders (meeting_id, name, role, responsibility) VALUES (?,?,?,?)",
-                  (meeting_id, s.get("name",""), s.get("role",""), s.get("responsibility","")))
-
-    conn.commit()
-    conn.close()
-
-    doc_text = f"Meeting: {title}\n\n{raw_content}"
-    vector_store.add_documents([Document(
-        page_content=doc_text,
-        metadata={"meeting_id": str(meeting_id), "title": title, "date": now}
-    )])
-
-    return meeting_id, dup_report
-
-
-# ══════════════════════════════════════════
-# FILE PARSING
-# ══════════════════════════════════════════
-def parse_uploaded_file(uploaded_file) -> str:
-    name = uploaded_file.name.lower()
-    if any(name.endswith(ext) for ext in [".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"]):
-        if groq_audio_client is None:
-            st.error("Audio processing is unavailable because the Groq client is not initialized.")
-            return ""
-        try:
-            file_bytes = uploaded_file.read()
-            transcription = groq_audio_client.audio.transcriptions.create(
-                file=(uploaded_file.name, file_bytes),
-                model="whisper-large-v3",
-                response_format="text"
-            )
-            return transcription
-        except Exception as e:
-            st.error(f"Error transcribing audio: {e}")
-            return ""
-    elif name.endswith(".txt"):
-        return uploaded_file.read().decode("utf-8", errors="ignore")
-    elif name.endswith(".pdf"):
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-            f.write(uploaded_file.read())
-            tmp_path = f.name
-        loader = PyPDFLoader(tmp_path)
-        pages  = loader.load()
-        os.unlink(tmp_path)
-        return "\n".join([p.page_content for p in pages])
-    elif name.endswith(".docx"):
-        doc = DocxReader(io.BytesIO(uploaded_file.read()))
-        return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-    return ""
-
-
-# ══════════════════════════════════════════
-# NL QUERY ENGINE
-# ══════════════════════════════════════════
-NL_QUERY_PROMPT = """You are an expert meeting intelligence analyst with access to a structured database. Base your entire answer ONLY on the provided DATABASE CONTENTS and SEMANTIC SEARCH RESULTS.
-   - Do not use outside knowledge or extrapolate facts.
-   - If the requested information cannot be found, say so clearly. Do not hallucinate.
-
-DATABASE CONTENTS (current snapshot):
-{db_context}
-
-SEMANTIC SEARCH RESULTS (related meeting transcripts):
-{vector_context}
-
-Answer the user's question accurately and concisely using the data above.
-- Be specific: name people, projects, deadlines
-- Structure multi-item answers as clean lists
-- If nothing relevant found, say so clearly
-- Never hallucinate data
-
-USER QUESTION: {question}"""
-
-def build_db_context() -> str:
-    conn = sqlite3.connect(INTEL_DB)
-    ctx  = []
-    df_meetings = pd.read_sql("SELECT id, title, ingested_at FROM meetings ORDER BY id DESC LIMIT 20", conn)
-    if not df_meetings.empty:
-        ctx.append("=== MEETINGS ===\n" + df_meetings.to_string(index=False))
-    df_ai = pd.read_sql("""SELECT a.task, a.owner, a.deadline, a.priority, a.status, m.title as meeting
-                           FROM action_items a JOIN meetings m ON a.meeting_id=m.id
-                           ORDER BY a.id DESC LIMIT 50""", conn)
-    if not df_ai.empty:
-        ctx.append("\n=== ACTION ITEMS ===\n" + df_ai.to_string(index=False))
-    df_esc = pd.read_sql("""SELECT e.issue, e.raised_by, e.assigned_to, e.severity, e.status,
-                                   e.occurrence_count, e.duplicate_of, m.title as meeting
-                            FROM escalations e JOIN meetings m ON e.meeting_id=m.id
-                            ORDER BY e.id DESC LIMIT 30""", conn)
-    if not df_esc.empty:
-        ctx.append("\n=== ESCALATIONS ===\n" + df_esc.to_string(index=False))
-    df_risks = pd.read_sql("""SELECT r.description, r.impact, r.teams_involved, r.severity, m.title as meeting
-                              FROM risks r JOIN meetings m ON r.meeting_id=m.id
-                              ORDER BY r.id DESC LIMIT 30""", conn)
-    if not df_risks.empty:
-        ctx.append("\n=== RISKS ===\n" + df_risks.to_string(index=False))
-    df_dec = pd.read_sql("""SELECT d.decision, d.rationale, d.decision_maker, m.title as meeting
-                            FROM decisions d JOIN meetings m ON d.meeting_id=m.id
-                            ORDER BY d.id DESC LIMIT 20""", conn)
-    if not df_dec.empty:
-        ctx.append("\n=== DECISIONS ===\n" + df_dec.to_string(index=False))
-    df_proj = pd.read_sql("""SELECT p.name, p.status, p.description, m.title as meeting
-                             FROM projects p JOIN meetings m ON p.meeting_id=m.id
-                             ORDER BY p.id DESC LIMIT 20""", conn)
-    if not df_proj.empty:
-        ctx.append("\n=== PROJECTS ===\n" + df_proj.to_string(index=False))
-    conn.close()
-    return "\n".join(ctx) if ctx else "No data ingested yet."
-
-def answer_nl_query(question: str, chat_history: list) -> str:
-    db_ctx = build_db_context()
-    try:
-        docs    = vector_store.similarity_search(question, k=3)
-        vec_ctx = "\n\n".join([f"[{d.metadata.get('title','')}]\n{d.page_content[:600]}" for d in docs])
-    except:
-        vec_ctx = "No semantic results."
-    prompt   = NL_QUERY_PROMPT.format(db_context=db_ctx, vector_context=vec_ctx, question=question)
-    messages = [SystemMessage(content=prompt)]
-    for msg in chat_history[-6:]:
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        elif msg["role"] == "assistant":
-            messages.append(AIMessage(content=msg["content"]))
-    messages.append(HumanMessage(content=question))
-    response = llm.invoke(messages).content.strip()
-    return re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
-
-
-# ══════════════════════════════════════════
-# DASHBOARD DATA HELPERS
-# ══════════════════════════════════════════
-def get_dashboard_stats():
-    conn  = sqlite3.connect(INTEL_DB)
-    stats = {}
-    for table in ["meetings", "action_items", "escalations", "risks", "decisions", "projects"]:
-        stats[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    stats["open_escalations"]    = conn.execute("SELECT COUNT(*) FROM escalations WHERE status='Open'").fetchone()[0]
-    stats["pending_tasks"]       = conn.execute("SELECT COUNT(*) FROM action_items WHERE status='Pending'").fetchone()[0]
-    stats["critical_risks"]      = conn.execute("SELECT COUNT(*) FROM risks WHERE severity='Critical'").fetchone()[0]
-    stats["recurring_escalations"] = conn.execute(
-        "SELECT COUNT(*) FROM escalations WHERE duplicate_of IS NULL AND occurrence_count > 1"
-    ).fetchone()[0]
-    conn.close()
-    return stats
-
-def get_table_df(table: str, limit: int = 100):
-    conn = sqlite3.connect(INTEL_DB)
-    try:
-        query_map = {
-            "action_items": """SELECT a.id, m.title as Meeting, a.task as Task, a.owner as Owner,
-                               a.deadline as Deadline, a.priority as Priority, a.status as Status
-                               FROM action_items a JOIN meetings m ON a.meeting_id=m.id
-                               ORDER BY a.id DESC LIMIT ?""",
-            "escalations":  """SELECT e.id, m.title as Meeting, e.issue as Issue, e.raised_by as 'Raised By',
-                               e.assigned_to as 'Assigned To', e.severity as Severity, e.status as Status,
-                               e.occurrence_count as 'Times Raised', e.duplicate_of as 'Duplicate Of',
-                               e.similarity_score as 'Similarity', e.detection_method as 'Detected Via'
-                               FROM escalations e JOIN meetings m ON e.meeting_id=m.id
-                               ORDER BY e.id DESC LIMIT ?""",
-            "risks":        """SELECT r.id, m.title as Meeting, r.description as Risk,
-                               r.impact as Impact, r.teams_involved as Teams, r.severity as Severity
-                               FROM risks r JOIN meetings m ON r.meeting_id=m.id
-                               ORDER BY r.id DESC LIMIT ?""",
-            "decisions":    """SELECT d.id, m.title as Meeting, d.decision as Decision,
-                               d.rationale as Rationale, d.decision_maker as 'Decision Maker'
-                               FROM decisions d JOIN meetings m ON d.meeting_id=m.id
-                               ORDER BY d.id DESC LIMIT ?""",
-            "projects":     """SELECT p.id, m.title as Meeting, p.name as Project,
-                               p.status as Status, p.description as Description
-                               FROM projects p JOIN meetings m ON p.meeting_id=m.id
-                               ORDER BY p.id DESC LIMIT ?""",
-            "stakeholders": """SELECT s.id, m.title as Meeting, s.name as Name,
-                               s.role as Role, s.responsibility as Responsibility
-                               FROM stakeholders s JOIN meetings m ON s.meeting_id=m.id
-                               ORDER BY s.id DESC LIMIT ?""",
-        }
-        q = query_map.get(table)
-        if q:
-            df = pd.read_sql(q, conn, params=(limit,))
-        else:
-            df = pd.read_sql(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", conn, params=(limit,))
-        conn.close()
-        return df
-    except Exception as e:
-        conn.close()
-        return pd.DataFrame()
-
-def update_status(table: str, row_id: int, new_status: str):
-    conn = sqlite3.connect(INTEL_DB)
-    conn.execute(f"UPDATE {table} SET status=? WHERE id=?", (new_status, row_id))
-    conn.commit()
-    conn.close()
-
-
-# ══════════════════════════════════════════
-# UI — PAGE CONFIG & GLOBAL STYLES
+# PAGE CONFIG & GLOBAL STYLES
 # ══════════════════════════════════════════
 st.set_page_config(
     page_title="MeetingIQ — Intelligence Platform",
     page_icon="🧠",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 st.markdown("""
@@ -820,14 +115,14 @@ with st.sidebar:
         ["🏠  Dashboard", "➕  Ingest Meeting", "✅  Action Items", "🚨  Escalations",
          "🔄  Recurring Issues", "⚠️  Risks", "🎯  Decisions", "📋  Projects",
          "👥  Stakeholders", "💬  Query Intelligence"],
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
     st.markdown("---")
     st.markdown('<div style="color:#8892a4;font-size:0.72rem;">Powered by Groq LLaMA 3.3 · Whisper-Large-V3 · ChromaDB</div>', unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════
-# HELPER: render a dup-detection report after ingest
+# SHARED UI HELPER
 # ══════════════════════════════════════════
 def render_dup_report(dup_report: list):
     if not dup_report:
@@ -884,13 +179,13 @@ if page == "🏠  Dashboard":
 
     col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
     kpis = [
-        (col1, stats['meetings'],               "Meetings Ingested",   "info"),
-        (col2, stats['projects'],               "Projects Tracked",    "info"),
-        (col3, stats['pending_tasks'],          "Pending Tasks",       "warn"),
-        (col4, stats['open_escalations'],       "Open Escalations",    "alert"),
-        (col5, stats['recurring_escalations'],  "Recurring Issues",    "purple"),
-        (col6, stats['critical_risks'],         "Critical Risks",      "alert"),
-        (col7, stats['decisions'],              "Decisions Logged",    "ok"),
+        (col1, stats['meetings'],              "Meetings Ingested",  "info"),
+        (col2, stats['projects'],              "Projects Tracked",   "info"),
+        (col3, stats['pending_tasks'],         "Pending Tasks",      "warn"),
+        (col4, stats['open_escalations'],      "Open Escalations",   "alert"),
+        (col5, stats['recurring_escalations'], "Recurring Issues",   "purple"),
+        (col6, stats['critical_risks'],        "Critical Risks",     "alert"),
+        (col7, stats['decisions'],             "Decisions Logged",   "ok"),
     ]
     for col, val, label, cls in kpis:
         with col:
@@ -898,7 +193,6 @@ if page == "🏠  Dashboard":
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Recurring issues callout banner (shown only when there are some)
     if stats['recurring_escalations'] > 0:
         st.markdown(f"""
         <div style="background:linear-gradient(135deg,#1a1428,#1e1535);border:1px solid #6b21a8;
@@ -1020,7 +314,7 @@ elif page == "➕  Ingest Meeting":
                         email_body = generate_meeting_summary_email_body(intel)
                         sent = send_email_alert(
                             subject=f"[MeetingIQ Summary] {intel.get('meeting_title','New Meeting')}",
-                            body=email_body, to_email=manager_email
+                            body=email_body, to_email=manager_email,
                         )
                         if sent:
                             st.success("📩 Dashboard summary email sent to Manager!")
@@ -1063,7 +357,7 @@ elif page == "➕  Ingest Meeting":
                             email_body = generate_meeting_summary_email_body(intel)
                             send_email_alert(
                                 subject=f"[MeetingIQ File Summary] {intel.get('meeting_title','New File Upload')}",
-                                body=email_body, to_email=manager_email
+                                body=email_body, to_email=manager_email,
                             )
             else:
                 st.error("Could not parse file content.")
@@ -1082,7 +376,7 @@ elif page == "➕  Ingest Meeting":
                     email_body = generate_meeting_summary_email_body(intel)
                     send_email_alert(
                         subject=f"[MeetingIQ Demo Summary] {intel.get('meeting_title')}",
-                        body=email_body, to_email=manager_email
+                        body=email_body, to_email=manager_email,
                     )
 
 
@@ -1174,7 +468,6 @@ elif page == "🚨  Escalations":
             if is_dup:
                 score = row.get("Similarity")
                 score_str = f" {int(float(score)*100)}%" if score and str(score) not in ["","None","nan"] else ""
-                method = str(row.get("Detected Via","")) or ""
                 extra_badges += f'<span class="badge badge-pink">↩ Dup of #{int(float(row.get("Duplicate Of")))}{score_str}</span> '
 
             st.markdown(f"""
@@ -1206,7 +499,7 @@ elif page == "🚨  Escalations":
 
 
 # ══════════════════════════════════════════
-# PAGE: RECURRING ISSUES  ← NEW PAGE
+# PAGE: RECURRING ISSUES
 # ══════════════════════════════════════════
 elif page == "🔄  Recurring Issues":
     st.markdown('<div class="page-title">🔄 Recurring Escalation Clusters</div>', unsafe_allow_html=True)
@@ -1251,7 +544,6 @@ elif page == "🔄  Recurring Issues":
             times  = int(canon.get("occurrence_count",1))
             status = str(canon.get("status",""))
 
-            # Timeline fetch
             timeline_df = get_escalation_recurrence_timeline(int(canon["id"]))
 
             st.markdown(f"""
@@ -1278,7 +570,6 @@ elif page == "🔄  Recurring Issues":
                 </div>
             """, unsafe_allow_html=True)
 
-            # Recurrence timeline
             st.markdown('<div style="color:#9ca3af;font-size:0.78rem;font-weight:600;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;">Recurrence Timeline</div>', unsafe_allow_html=True)
 
             if not timeline_df.empty:
@@ -1319,14 +610,11 @@ elif page == "🔄  Recurring Issues":
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-            # Quick resolve button for open clusters
             if status == "Open":
                 canonical_id = int(canon["id"])
                 if st.button(f"✅ Resolve entire cluster #{canonical_id}", key=f"cluster_resolve_{canonical_id}"):
                     conn = sqlite3.connect(INTEL_DB)
-                    # Resolve canonical
                     conn.execute("UPDATE escalations SET status='Resolved' WHERE id=?", (canonical_id,))
-                    # Resolve all duplicates
                     conn.execute("UPDATE escalations SET status='Resolved' WHERE duplicate_of=?", (canonical_id,))
                     conn.commit()
                     conn.close()
@@ -1337,18 +625,18 @@ elif page == "🔄  Recurring Issues":
                     )
                     send_email_alert(
                         f"[Recurring Issue Resolved] Cluster #{canonical_id} Closed",
-                        body_cluster, manager_email
+                        body_cluster, manager_email,
                     )
                     st.success(f"Cluster #{canonical_id} and all {len(dupes)} duplicate(s) marked Resolved!")
                     st.rerun()
 
             st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── Summary analytics ──────────────────────────────────────────────────
+        # ── Summary analytics ──────────────────────────────────────────────
         st.markdown("---")
         st.markdown('<div class="section-header">📊 Detection Method Breakdown</div>', unsafe_allow_html=True)
 
-        conn  = sqlite3.connect(INTEL_DB)
+        conn = sqlite3.connect(INTEL_DB)
         df_methods = pd.read_sql("""
             SELECT detection_method as Method, COUNT(*) as Count
             FROM escalations WHERE duplicate_of IS NOT NULL
